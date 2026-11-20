@@ -1,12 +1,10 @@
 # Changelog
 
-All notable changes to ridgewarden-lightning are listed here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is
-what appears on its GitHub release page. Validated in CI by
-[patchnotes](https://github.com/Londopy/patchnotes).
+All notable changes to ridgewarden-lightning are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is what appears on its GitHub release page. Validated in CI by [patchnotes](https://github.com/Londopy/patchnotes).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-20
 
 ### Added
 
@@ -29,4 +27,5 @@ what appears on its GitHub release page. Validated in CI by
 - Strikes outside the ring of receivers are marked, and the ring is drawn on the map.
 - The APRS weather parser also reads wind direction, sustained wind and gust (`Wx::wind_dir_deg`, `wind_mph`, `gust_mph`) for other apps to use.
 
-[Unreleased]: https://github.com/Londopy/ridgewarden-lightning/commits/main
+[Unreleased]: https://github.com/Londopy/ridgewarden-lightning/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Londopy/ridgewarden-lightning/releases/tag/v0.1.0

@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! id ridgewarden-lightning >/dev/null 2>&1; then
+        adduser --system --group --home /var/lib/ridgewarden-lightning --no-create-home ridgewarden-lightning
+    fi
+    adduser ridgewarden-lightning ridgewarden >/dev/null
+    install -d -m 750 -o ridgewarden-lightning -g ridgewarden-lightning /var/lib/ridgewarden-lightning
+    # an upgrade from when apps ran as the core's user leaves files it owned
+    chown -R ridgewarden-lightning:ridgewarden-lightning /var/lib/ridgewarden-lightning
+    if [ ! -f /etc/ridgewarden/lightning.toml ]; then
+        /usr/bin/ridgewarden-lightning --config /etc/ridgewarden/lightning.toml init
+    fi
+    # its webhook URLs and passphrases are for this app only, not the other apps
+    # in the ridgewarden group
+    chown root:ridgewarden-lightning /etc/ridgewarden/lightning.toml
+    chmod 640 /etc/ridgewarden/lightning.toml
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        # start once the core is set up; until then there's nothing to follow
+        if [ -f /etc/ridgewarden/ridgewarden.toml ]; then
+            systemctl enable ridgewarden-lightning >/dev/null 2>&1 || true
+            systemctl restart ridgewarden-lightning || true
+        fi
+    fi
+fi

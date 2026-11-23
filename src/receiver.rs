@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::app::App;
-use crate::config::{ReceiverCfg, Source};
+use crate::config::{Bearings, ReceiverCfg, Source};
 use crate::toga::{Toga, parse_line};
 
 /// Arrivals held while the core can't be reached, at most.
@@ -34,10 +34,10 @@ pub struct Pending {
 }
 
 impl Pending {
-    pub fn take_lines(&mut self, lines: &[String], min_rms: f64) {
+    pub fn take_lines(&mut self, lines: &[String], cfg: &ReceiverCfg) {
         for l in lines {
             match parse_line(l) {
-                Ok(Some(t)) if t.rms >= min_rms => {
+                Ok(Some(t)) if cfg.keep(&t) => {
                     if self.togas.len() < MAX_PENDING {
                         self.togas.push(t);
                     } else {
@@ -215,8 +215,13 @@ pub fn check_source(cfg: &ReceiverCfg, now: i64) -> Result<String> {
         // the first one is probably cut
         lines.remove(0);
     }
+    let everything = ReceiverCfg {
+        min_rms: 0.0,
+        min_impulse: 0.0,
+        ..cfg.clone()
+    };
     let mut p = Pending::default();
-    p.take_lines(&lines, 0.0);
+    p.take_lines(&lines, &everything);
     let mut out = format!(
         "{}: {} lines read from the end, {} arrivals, {} that didn't parse",
         path.display(),
@@ -236,11 +241,22 @@ pub fn check_source(cfg: &ReceiverCfg, now: i64) -> Result<String> {
                     "\nit's in the future: check the GPS timing (vttime) or this computer's clock",
                 );
             }
-            let weak = p.togas.iter().filter(|t| t.rms < cfg.min_rms).count();
+            let weak = p.togas.iter().filter(|t| !cfg.keep(t)).count();
             if weak > 0 {
                 out.push_str(&format!(
-                    "\n{weak} of them are under min_rms and would be dropped"
+                    "\n{weak} of them are under min_rms or min_impulse and would be dropped"
                 ));
+            }
+            let bearings = p.togas.iter().filter(|t| t.bearing.is_some()).count();
+            let how = match cfg.bearings {
+                Bearings::Axis => "used as lines through the site (bearings = \"axis\")",
+                Bearings::Full => "used as directions (bearings = \"full\")",
+                Bearings::Off => "not used (bearings = \"off\")",
+            };
+            if bearings == 0 {
+                out.push_str("\nno bearings (vttoga adds them with crossed loops, -p)");
+            } else {
+                out.push_str(&format!("\n{bearings} with a bearing, {how}"));
             }
         }
         None => out.push_str("\nno H or M records yet: is vttoga running and triggering?"),
@@ -266,7 +282,7 @@ fn poll_files(cfg: &ReceiverCfg, pending: &Mutex<Pending>) {
         match read() {
             Ok(lines) => {
                 set_error(pending, None);
-                pending.lock().unwrap().take_lines(&lines, cfg.min_rms);
+                pending.lock().unwrap().take_lines(&lines, cfg);
             }
             Err(e) => set_error(pending, Some(format!("can't read {what}: {e}"))),
         }
@@ -274,7 +290,7 @@ fn poll_files(cfg: &ReceiverCfg, pending: &Mutex<Pending>) {
     }
 }
 
-async fn run_command(cmd: String, min_rms: f64, pending: Arc<Mutex<Pending>>) {
+async fn run_command(cmd: String, cfg: ReceiverCfg, pending: Arc<Mutex<Pending>>) {
     loop {
         let child = tokio::process::Command::new("sh")
             .arg("-c")
@@ -295,7 +311,7 @@ async fn run_command(cmd: String, min_rms: f64, pending: Arc<Mutex<Pending>>) {
         let mut buf = vec![];
         loop {
             match read_line(&mut out, &mut buf).await {
-                Ok(Some(l)) => pending.lock().unwrap().take_lines(&[l], min_rms),
+                Ok(Some(l)) => pending.lock().unwrap().take_lines(&[l], &cfg),
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("reading toga_command: {e}");
@@ -382,7 +398,8 @@ fn gps_state(cfg: &ReceiverCfg, fix: &Fix, now: i64, since: i64) -> &'static str
 
 /// One report for the core. `clock_s` is how far the newest arrival time is from this
 /// computer's clock: vttoga's times come from GPS, so a big gap means the GPS timing or
-/// the system clock is wrong.
+/// the system clock is wrong. Bearings go out folded into 0 to 180 for loops alone, and
+/// not at all when they're off.
 pub fn report(
     site: &str,
     cfg: &ReceiverCfg,
@@ -397,13 +414,24 @@ pub fn report(
         .map(|t| t.t_us)
         .max()
         .map(|t| ((t / 1000 - now) as f64 / 100.0).round() / 10.0);
+    let m = cfg.bearings.modulus();
+    let bearing = |t: &Toga| {
+        let m = m?;
+        // to vttoga's one decimal, which can round up onto the modulus itself
+        Some(((t.bearing? % m) * 10.0).round() / 10.0 % m)
+    };
     json!({
         "site": site,
         "lat": cfg.lat,
         "lon": cfg.lon,
         "sigma_us": cfg.timing_sigma_us,
+        "bearing_sigma_deg": m.map(|_| cfg.bearing_sigma_deg),
+        "bearing_mod": m,
         "gps": gps,
-        "togas": togas.iter().map(|t| json!([t.t_us, t.rms])).collect::<Vec<_>>(),
+        "togas": togas
+            .iter()
+            .map(|t| json!([t.t_us, t.rms, t.impulse, bearing(t)]))
+            .collect::<Vec<_>>(),
         "dropped": dropped,
         "bad": p.bad,
         "error": p.error,
@@ -427,7 +455,7 @@ pub async fn run(app: Arc<App>) {
     let pending = Arc::new(Mutex::new(Pending::default()));
     match cfg.source() {
         Source::Command(cmd) => {
-            tokio::spawn(run_command(cmd, cfg.min_rms, pending.clone()));
+            tokio::spawn(run_command(cmd, cfg.clone(), pending.clone()));
         }
         _ => {
             let (c, p) = (cfg.clone(), pending.clone());
@@ -542,39 +570,114 @@ mod tests {
         assert_eq!(t.read().unwrap(), vec!["H 4.000000 1e-02 3.00"]);
     }
 
+    fn cfg(extra: &str) -> ReceiverCfg {
+        toml::from_str(&format!(
+            "lat = 35.0\nlon = -120.0\ntoga_file = \"x\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn check_source_reports_what_the_file_holds() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("toga");
         append(
             &p,
-            "H 1795000000.000000 1e-02 3.00\nH x\nH 1795000010.500000 1e-02 3.00\n",
+            "H 1795000000.000000 1e-02 3.00\nH x\nH 1795000010.500000 1e-02 1.10 87.5\n",
         );
-        let mut cfg: ReceiverCfg =
-            toml::from_str("lat = 35.0\nlon = -120.0\ntoga_file = \"x\"").unwrap();
+        let mut cfg = cfg("min_impulse = 2.0");
         cfg.toga_file = Some(p);
         let s = check_source(&cfg, 1_795_000_012_500).unwrap();
         assert!(s.contains("2 arrivals, 1 that didn't parse"), "{s}");
         assert!(s.contains("2.0 s before"), "{s}");
+        assert!(
+            s.contains("1 of them are under min_rms or min_impulse"),
+            "{s}"
+        );
+        assert!(s.contains("1 with a bearing, used as lines"), "{s}");
         let s = check_source(&cfg, 1_795_000_000_000).unwrap();
         assert!(s.contains("in the future"), "{s}");
     }
 
     #[test]
-    fn pending_counts_bad_lines_and_skips_weak_sferics() {
+    fn pending_counts_bad_lines_and_skips_weak_or_dull_sferics() {
         let mut p = Pending::default();
         let lines: Vec<String> = [
             "H 1.000000 5.0e-02 3.00",
             "H 2.000000 1.0e-04 3.00",
+            "H 3.000000 5.0e-02 1.05",
             "H x",
             "E",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
-        p.take_lines(&lines, 1e-3);
+        p.take_lines(&lines, &cfg("min_rms = 1e-3\nmin_impulse = 1.5"));
         assert_eq!(p.togas.len(), 1);
+        assert_eq!(p.togas[0].t_us, 1_000_000);
         assert_eq!(p.bad, 1);
+    }
+
+    fn togas_of(r: &Value) -> Vec<Value> {
+        r["togas"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn reports_carry_impulse_ratios_and_bearings_as_configured() {
+        let togas = [
+            Toga {
+                t_us: 1,
+                rms: 0.01,
+                impulse: Some(4.71),
+                bearing: Some(300.0),
+            },
+            Toga {
+                t_us: 2,
+                rms: 0.01,
+                impulse: None,
+                bearing: Some(179.96),
+            },
+            Toga {
+                t_us: 3,
+                rms: 0.01,
+                impulse: None,
+                bearing: Some(360.0),
+            },
+        ];
+        let p = Pending::default();
+        let axis = report("tst-a", &cfg(""), "locked", &p, &togas, 0, 0);
+        assert_eq!(axis["bearing_mod"], json!(180.0));
+        assert_eq!(axis["bearing_sigma_deg"], json!(5.0));
+        assert_eq!(
+            togas_of(&axis),
+            vec![
+                json!([1, 0.01, 4.71, 120.0]),
+                json!([2, 0.01, null, 0.0]),
+                json!([3, 0.01, null, 0.0])
+            ]
+        );
+        let full = report(
+            "tst-a",
+            &cfg("bearings = \"full\""),
+            "locked",
+            &p,
+            &togas,
+            0,
+            0,
+        );
+        assert_eq!(togas_of(&full)[0], json!([1, 0.01, 4.71, 300.0]));
+        assert_eq!(togas_of(&full)[2], json!([3, 0.01, null, 0.0]));
+        let off = report(
+            "tst-a",
+            &cfg("bearings = \"off\""),
+            "locked",
+            &p,
+            &togas,
+            0,
+            0,
+        );
+        assert_eq!(off["bearing_mod"], Value::Null);
+        assert_eq!(togas_of(&off)[0], json!([1, 0.01, 4.71, null]));
     }
 
     #[cfg(unix)]
@@ -583,7 +686,7 @@ mod tests {
         let p = Arc::new(Mutex::new(Pending::default()));
         let task = tokio::spawn(run_command(
             "printf 'H 1795000000.000001 1.0e-02 3.00\nE\n'".into(),
-            0.0,
+            cfg(""),
             p.clone(),
         ));
         for _ in 0..50 {
@@ -625,8 +728,7 @@ mod tests {
 
     #[test]
     fn gps_without_a_recent_fix_is_unlocked() {
-        let mut cfg: ReceiverCfg =
-            toml::from_str("lat = 35.0\nlon = -120.0\ntoga_file = \"x\"").unwrap();
+        let mut cfg = cfg("");
         let fix = Fix::default();
         assert_eq!(gps_state(&cfg, &fix, 0, 0), "unchecked");
         cfg.gpsd = Some("127.0.0.1:2947".into());

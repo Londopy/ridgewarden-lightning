@@ -40,6 +40,7 @@ impl App {
         }
         let core = CoreClient::new(&cfg.core.url, token)?;
         let db = open_db(&cfg.db_path(), PROJECTIONS)?;
+        crate::store::migrate(&db)?;
         db.execute_batch(ridgewarden_client::alerts::SCHEMA)?;
         db.execute_batch(crate::locate::SCHEMA)?;
         db.execute_batch(crate::rain::SCHEMA)?;

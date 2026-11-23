@@ -70,9 +70,10 @@ pub fn spawn_loops(app: Arc<app::App>) {
     if app.cfg.solver.enabled {
         let a = app.clone();
         tokio::spawn(async move {
+            let mut turned = locate::Turned::default();
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                match locate::round(&a).await {
+                match locate::round(&a, &mut turned).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("located {n} strikes"),
                     Err(e) => tracing::warn!("solver: {e:#}"),

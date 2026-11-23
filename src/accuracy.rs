@@ -12,11 +12,13 @@ use ridgewarden_client::util::{esc, now_ms, short_time};
 
 use crate::agreement::summary;
 use crate::app::App;
+use crate::config::WatchArea;
 use crate::coverage::{BINS, area_worst, bin_label, inside, ring_summary, without_each};
 use crate::geo::LatLon;
 use crate::map::{self, Map};
-use crate::solve::expected;
+use crate::solve::{Rx, expected};
 use crate::store;
+use crate::watch;
 use crate::web::{Fail, page, ring_of};
 
 const WEEK_MS: i64 = 7 * 86_400_000;
@@ -59,19 +61,20 @@ fn agreements_section(app: &App) -> Result<String, Fail> {
 }
 
 fn timing_section(
-    sites: &[(LatLon, f64)],
+    sites: &[Rx],
     v: f64,
     ring: &[LatLon],
     est: Option<(f64, usize)>,
     period: &str,
 ) -> String {
     let Some((sigma_us, n)) = est.filter(|e| e.1 >= 10) else {
-        return "<p class=\"mute small\">Once ten or more strikes have been located by four or more receivers, \
-                their residuals show what the timing error really is.</p>"
+        return "<p class=\"mute small\">Once ten or more strikes have been located by four or more receivers from \
+                their arrival times alone, their residuals show what the timing error really is. Strikes with \
+                bearings in the fit don't count, since the bearings pull it off the times.</p>"
             .into();
     };
     let (lo, hi) = sites.iter().fold((f64::MAX, f64::MIN), |(lo, hi), s| {
-        (lo.min(s.1 * 1e6), hi.max(s.1 * 1e6))
+        (lo.min(s.sigma * 1e6), hi.max(s.sigma * 1e6))
     });
     let configured = if (hi - lo).abs() < 0.05 {
         format!("{lo:.0} us")
@@ -86,12 +89,18 @@ fn timing_section(
         format!("about <b>{sigma_us:.1} us</b>")
     };
     let mut b = format!(
-        "<p>The residuals of {n} strikes located by four or more receivers in {period} point to {amount} \
-         of timing error per arrival; the receivers are configured for {configured}. \
+        "<p>The residuals of {n} strikes located by four or more receivers from their arrival times alone in \
+         {period} point to {amount} of timing error per arrival; the receivers are configured for {configured}. \
          If those differ a lot, set <code>timing_sigma_us</code> to the measured value so the ellipses tell the truth, \
          and look again after a few storms."
     );
-    let measured: Vec<(LatLon, f64)> = sites.iter().map(|s| (s.0, sigma_us * 1e-6)).collect();
+    let measured: Vec<Rx> = sites
+        .iter()
+        .map(|s| Rx {
+            sigma: sigma_us * 1e-6,
+            ..*s
+        })
+        .collect();
     if let Some(s) = ring_summary(&measured, v, ring) {
         let _ = write!(
             b,
@@ -103,7 +112,30 @@ fn timing_section(
     b
 }
 
-fn losses_section(app: &App, named: &[(String, LatLon, f64)], v: f64, ring: &[LatLon]) -> String {
+/// The bearing residuals next to the bearing errors the receivers are configured for.
+fn bearings_section(sites: &[Rx], est: Option<(f64, usize)>, period: &str) -> String {
+    let Some((rms, n)) = est.filter(|e| e.1 >= 10) else {
+        return String::new();
+    };
+    let (lo, hi) = sites
+        .iter()
+        .filter_map(|s| s.bearing_sigma.map(f64::to_degrees))
+        .fold((f64::MAX, f64::MIN), |(lo, hi), s| (lo.min(s), hi.max(s)));
+    let configured = if lo > hi {
+        String::new()
+    } else if (hi - lo).abs() < 0.05 {
+        format!("; the receivers that send them are configured for {lo:.1} deg")
+    } else {
+        format!("; the receivers that send them are configured for {lo:.1} to {hi:.1} deg")
+    };
+    format!(
+        "<p>The {n} bearings in fits of four or more receivers in {period} are off by <b>{rms:.1} deg</b> RMS\
+         {configured}. That reads a little low, since each bearing pulls its fit toward itself; if it's well above \
+         the configured error, raise <code>bearing_sigma_deg</code> toward it.</p>"
+    )
+}
+
+fn losses_section(app: &App, named: &[(String, Rx)], v: f64, ring: &[LatLon]) -> String {
     if named.len() < 4 {
         return String::new();
     }
@@ -130,7 +162,7 @@ fn losses_section(app: &App, named: &[(String, LatLon, f64)], v: f64, ring: &[La
     b
 }
 
-fn areas_section(app: &App, sites: &[(LatLon, f64)], v: f64, ring: &[LatLon]) -> String {
+fn areas_section(app: &App, areas: &[WatchArea], sites: &[Rx], v: f64, ring: &[LatLon]) -> String {
     if app.cfg.watch.is_empty() {
         return String::new();
     }
@@ -139,6 +171,15 @@ fn areas_section(app: &App, sites: &[(LatLon, f64)], v: f64, ring: &[LatLon]) ->
          <th>Share inside the ring</th></tr>",
     );
     for a in &app.cfg.watch {
+        let Some(a) = areas.iter().find(|p| p.name == a.name) else {
+            let _ = write!(
+                b,
+                "<tr><td>{}</td><td colspan=2 class=mute>no position for {} yet</td></tr>",
+                esc(&a.name),
+                esc(a.site.as_deref().unwrap_or_default())
+            );
+            continue;
+        };
         let pts = a.samples();
         let worst = area_worst(sites, v, &pts)
             .map(|k| format!("{k:.1} km"))
@@ -160,16 +201,25 @@ pub async fn page_handler(State(app): State<Arc<App>>) -> Result<Html<String>, F
     let v = app.cfg.velocity();
     let rx = store::receivers(&app.db(), now)?;
     let ring = ring_of(&rx);
-    let (_, est) = store::fits(&app.db(), (now - WEEK_MS) * 1000)?;
-    let named: Vec<(String, LatLon, f64)> = rx
+    let res = store::fits(&app.db(), (now - WEEK_MS) * 1000)?;
+    let named: Vec<(String, Rx)> = rx
         .iter()
-        .map(|r| (r.site.clone(), r.pos, r.sigma_us * 1e-6))
+        .map(|r| {
+            let rx = Rx {
+                pos: r.pos,
+                sigma: r.sigma_us * 1e-6,
+                bearing_sigma: r.bearing_sigma_deg.map(f64::to_radians),
+            };
+            (r.site.clone(), rx)
+        })
         .collect();
-    let sites: Vec<(LatLon, f64)> = named.iter().map(|n| (n.1, n.2)).collect();
+    let sites: Vec<Rx> = named.iter().map(|n| n.1).collect();
+    let areas = watch::placed(&app.db(), &app.cfg.watch)?;
     let mut b = format!(
         "<h1>Accuracy</h1><style>{}</style><p class=\"mute small\">How well the receivers that reported in the last \
-         week can locate a strike, worked out from their positions and timing errors: the same calculation that \
-         gives each strike its ellipse, done for every point on the map, assuming every receiver hears the strike.</p>",
+         week can locate a strike, worked out from their positions, timing errors and, for those that send them, \
+         bearing errors: the same calculation that gives each strike its ellipse, done for every point on the map, \
+         assuming every receiver hears the strike.</p>",
         map::CSS
     );
     if rx.len() < 3 {
@@ -183,7 +233,7 @@ pub async fn page_handler(State(app): State<Arc<App>>) -> Result<Html<String>, F
         let m = Map {
             receivers: &rx,
             strikes: &[],
-            areas: &app.cfg.watch,
+            areas: &areas,
             now_us: now * 1000,
             ring: &ring,
             coverage: Some(&cov),
@@ -212,7 +262,8 @@ pub async fn page_handler(State(app): State<Arc<App>>) -> Result<Html<String>, F
         } else {
             "the last week".to_string()
         };
-        b.push_str(&timing_section(&sites, v, &ring, est, &period));
+        b.push_str(&timing_section(&sites, v, &ring, res.timing, &period));
+        b.push_str(&bearings_section(&sites, res.bearings, &period));
         let mut axes: Vec<f64> = recent
             .iter()
             .filter(|s| inside(s.pos, &ring))
@@ -226,7 +277,7 @@ pub async fn page_handler(State(app): State<Arc<App>>) -> Result<Html<String>, F
             );
         }
         b.push_str(&losses_section(&app, &named, v, &ring));
-        b.push_str(&areas_section(&app, &sites, v, &ring));
+        b.push_str(&areas_section(&app, &areas, &sites, v, &ring));
     }
     b.push_str(&agreements_section(&app)?);
     Ok(page(&app, "/accuracy", "Accuracy", &b, false).await)

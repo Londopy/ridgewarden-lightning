@@ -51,6 +51,12 @@ pub struct CoreCfg {
     pub token_file: PathBuf,
 }
 
+/// The smallest timing error, microseconds, a receiver may claim: a GPS pulse is good to
+/// about one, and a smaller claim would let one site outweigh all the others in a fit.
+pub const TIMING_FLOOR_US: f64 = 1.0;
+/// The same for a bearing's error, degrees.
+pub const BEARING_FLOOR_DEG: f64 = 0.5;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiverCfg {
@@ -75,6 +81,16 @@ pub struct ReceiverCfg {
     /// drop sferics weaker than this RMS amplitude (vttoga's units)
     #[serde(default)]
     pub min_rms: f64,
+    /// drop sferics whose onset is less sharp than this (vttoga's impulse ratio; steady
+    /// noise is near 1); M records carry none and are kept
+    #[serde(default)]
+    pub min_impulse: f64,
+    /// how to read the bearing vttoga adds with crossed loops
+    #[serde(default)]
+    pub bearings: Bearings,
+    /// one bearing's error (1 sigma), degrees
+    #[serde(default = "d_5")]
+    pub bearing_sigma_deg: f64,
     /// seconds between reports to the core
     #[serde(default = "d_10")]
     pub batch_s: u64,
@@ -86,6 +102,30 @@ pub struct ReceiverCfg {
     pub gpsd: Option<String>,
 }
 
+/// What vttoga's bearings mean, from how its `-p` option is set.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Bearings {
+    /// loops only: 0 to 180, a line through the site with the source at either end
+    #[default]
+    Axis,
+    /// loops and a whip (E-field channel): 0 to 360
+    Full,
+    /// not used
+    Off,
+}
+
+impl Bearings {
+    /// Degrees after which a bearing repeats; None when bearings aren't used.
+    pub fn modulus(self) -> Option<f64> {
+        match self {
+            Bearings::Axis => Some(180.0),
+            Bearings::Full => Some(360.0),
+            Bearings::Off => None,
+        }
+    }
+}
+
 pub enum Source {
     File(PathBuf),
     Dir(PathBuf),
@@ -95,6 +135,11 @@ pub enum Source {
 impl ReceiverCfg {
     pub fn pos(&self) -> LatLon {
         LatLon::new(self.lat, self.lon)
+    }
+
+    /// Whether a sferic gets past min_rms and min_impulse.
+    pub fn keep(&self, t: &crate::toga::Toga) -> bool {
+        t.rms >= self.min_rms && t.impulse.is_none_or(|i| i >= self.min_impulse)
     }
 
     pub fn source(&self) -> Source {
@@ -113,7 +158,8 @@ pub struct SolverCfg {
     /// run the solver here; one site is enough
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "d_3")]
+    /// fewest receivers whose arrival times make a strike; 3 for a three-receiver network
+    #[serde(default = "d_4")]
     pub min_sites: usize,
     /// VLF group velocity as a fraction of c (vtspot's default)
     #[serde(default = "d_vf")]
@@ -169,6 +215,10 @@ pub struct WatchArea {
     /// or a circle: [lat, lon] and a radius
     #[serde(default)]
     pub center: Option<[f64; 2]>,
+    /// or a circle around a site (node name): its receiver's antenna, or the node's own
+    /// position from the core's polls
+    #[serde(default)]
+    pub site: Option<String>,
     #[serde(default)]
     pub radius_km: Option<f64>,
     /// APRS weather stations whose rain gauges cover the area, e.g. ["CW0000"]
@@ -191,8 +241,11 @@ fn d_token() -> PathBuf {
 fn d_sigma() -> f64 {
     20.0
 }
-fn d_3() -> usize {
-    3
+fn d_4() -> usize {
+    4
+}
+fn d_5() -> f64 {
+    5.0
 }
 fn d_10() -> u64 {
     10
@@ -247,7 +300,7 @@ impl Default for SolverCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            min_sites: 3,
+            min_sites: d_4(),
             velocity_factor: d_vf(),
             settle_s: 180,
             max_range_km: 300.0,
@@ -312,8 +365,12 @@ impl Config {
         if self.watch_window_min == 0 {
             bail!("watch_window_min must be at least 1");
         }
-        for w in &self.watch {
+        for (i, w) in self.watch.iter().enumerate() {
             w.validate(self.rain.is_some())?;
+            // the name is the alert's key
+            if self.watch[..i].iter().any(|o| o.name == w.name) {
+                bail!("two watch areas are named {:?}", w.name);
+            }
         }
         self.alerts.validate()
     }
@@ -340,8 +397,14 @@ impl ReceiverCfg {
         if !self.pos().valid() {
             bail!("receiver.lat and receiver.lon must be a real position in degrees");
         }
-        if !(self.timing_sigma_us > 0.0 && self.timing_sigma_us <= 1000.0) {
-            bail!("receiver.timing_sigma_us must be above 0 and at most 1000");
+        if !(self.timing_sigma_us >= TIMING_FLOOR_US && self.timing_sigma_us <= 1000.0) {
+            bail!("receiver.timing_sigma_us must be at least {TIMING_FLOOR_US} and at most 1000");
+        }
+        if !(self.min_impulse.is_finite() && self.min_impulse >= 0.0) {
+            bail!("receiver.min_impulse must be 0 or more");
+        }
+        if !(self.bearing_sigma_deg >= BEARING_FLOOR_DEG && self.bearing_sigma_deg <= 45.0) {
+            bail!("receiver.bearing_sigma_deg must be at least {BEARING_FLOOR_DEG} and at most 45");
         }
         let sources = [
             self.toga_file.is_some(),
@@ -372,11 +435,12 @@ impl WatchArea {
         if n.trim().is_empty() || n.len() > 60 {
             bail!("each watch area needs a name of up to 60 characters");
         }
-        match (self.polygon.len(), self.center, self.radius_km) {
-            (0, Some(c), Some(r)) if r > 0.0 && LatLon::new(c[0], c[1]).valid() => {}
-            (3.., None, None) if self.corners().iter().all(LatLon::valid) => {}
+        match (self.polygon.len(), self.center, &self.site, self.radius_km) {
+            (0, Some(c), None, Some(r)) if r > 0.0 && LatLon::new(c[0], c[1]).valid() => {}
+            (0, None, Some(s), Some(r)) if r > 0.0 && valid_node(&norm_node(s)) => {}
+            (3.., None, None, None) if self.corners().iter().all(LatLon::valid) => {}
             _ => bail!(
-                "watch area {n:?} needs either polygon (3 or more [lat, lon] corners) or center and radius_km"
+                "watch area {n:?} needs one of: polygon (3 or more [lat, lon] corners), center and radius_km, or site (a node name) and radius_km"
             ),
         }
         for s in &self.rain_stations {
@@ -461,9 +525,12 @@ token_file = "/var/lib/ridgewarden/local.token"
 # name = "tst-cuesta"            # defaults to this site's node name
 # lat = 35.3500                  # the antenna, surveyed
 # lon = -120.6500
-# timing_sigma_us = 20           # one arrival's timing error, 1 sigma
+# timing_sigma_us = 20           # one arrival's timing error, 1 sigma; 1 or more
 # toga_dir = "/var/lib/vlf/toga" # vttoga -d output; or toga_file, or toga_command
 # min_rms = 0.0
+# min_impulse = 0.0              # drop sferics with a duller onset (steady noise is near 1)
+# bearings = "axis"              # crossed loops: "axis" (0-180), "full" with a whip (0-360), or "off"
+# bearing_sigma_deg = 5          # one bearing's error, 1 sigma; 0.5 or more
 # batch_s = 10
 # max_per_batch = 1000
 # gpsd = "127.0.0.1:2947"        # drop detections while the GPS has no fix
@@ -471,7 +538,7 @@ token_file = "/var/lib/ridgewarden/local.token"
 # Locate strikes from every site's detections. One site is enough.
 [solver]
 enabled = false
-min_sites = 3                    # 4 once there are four or more receivers
+min_sites = 4                    # 3 for a network of three receivers
 velocity_factor = 0.9922
 settle_s = 180                   # longer than the core's sync interval
 max_range_km = 300
@@ -496,6 +563,10 @@ max_chi2 = 9
 # name = "Near the hub"
 # center = [35.30, -120.66]
 # radius_km = 10
+# [[watch]]
+# name = "Near Cuesta"
+# site = "tst-cuesta"            # around a site: its receiver, or its node's own position
+# radius_km = 15
 
 [site_names]
 # "tst-cuesta" = "Cuesta Ridge"
@@ -534,11 +605,77 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        // two watch areas, one of each shape, and a receiver with one source
+        // three watch areas, one of each shape, and a receiver with one source
         let c: Config = toml::from_str(&text).unwrap();
         c.validate().unwrap();
-        assert_eq!(c.watch.len(), 2);
-        assert!(c.receiver.is_some() && c.rain.is_some());
+        assert_eq!(c.watch.len(), 3);
+        assert_eq!(c.watch[2].site.as_deref(), Some("tst-cuesta"));
+        let r = c.receiver.unwrap();
+        assert_eq!((r.bearings, r.bearing_sigma_deg), (Bearings::Axis, 5.0));
+        assert!(c.rain.is_some());
+    }
+
+    #[test]
+    fn four_sites_make_a_strike_unless_set_otherwise() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.solver.min_sites, 4);
+        assert_eq!(SolverCfg::default().min_sites, 4);
+        let c: Config = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(c.solver.min_sites, 4);
+    }
+
+    #[test]
+    fn a_watch_area_is_one_shape_with_its_own_name() {
+        let area = |extra: &str| {
+            let c: Config = toml::from_str(&format!("[[watch]]\nname = \"a\"\n{extra}")).unwrap();
+            c.validate()
+        };
+        area("site = \"TST-Cuesta\"\nradius_km = 5").unwrap();
+        assert!(area("site = \"tst cuesta!\"\nradius_km = 5").is_err());
+        assert!(area("site = \"tst-cuesta\"").is_err(), "needs a radius");
+        assert!(area("site = \"tst-cuesta\"\ncenter = [35.0, -120.0]\nradius_km = 5").is_err());
+        let two: Config = toml::from_str(
+            "[[watch]]\nname = \"a\"\nsite = \"tst-a\"\nradius_km = 5\n\
+             [[watch]]\nname = \"a\"\nsite = \"tst-b\"\nradius_km = 5",
+        )
+        .unwrap();
+        assert!(two.validate().is_err());
+    }
+
+    #[test]
+    fn bearings_are_read_by_how_vttoga_was_set_up() {
+        let r = |s: &str| -> ReceiverCfg {
+            toml::from_str(&format!("lat = 35.0\nlon = -120.0\ntoga_file = \"x\"\n{s}")).unwrap()
+        };
+        assert_eq!(r("").bearings.modulus(), Some(180.0));
+        assert_eq!(r("bearings = \"full\"").bearings.modulus(), Some(360.0));
+        assert_eq!(r("bearings = \"off\"").bearings.modulus(), None);
+        let toga = |rms: f64, impulse: Option<f64>| crate::toga::Toga {
+            t_us: 0,
+            rms,
+            impulse,
+            bearing: None,
+        };
+        let cfg = r("min_rms = 0.01\nmin_impulse = 3.0");
+        assert!(cfg.keep(&toga(0.02, Some(5.0))));
+        assert!(!cfg.keep(&toga(0.02, Some(1.2))), "dull onset");
+        assert!(!cfg.keep(&toga(0.001, Some(5.0))), "weak");
+        assert!(
+            cfg.keep(&toga(0.02, None)),
+            "M records have no impulse ratio"
+        );
+    }
+
+    #[test]
+    fn a_receiver_cant_claim_better_than_the_floors() {
+        let r = |s: &str| -> ReceiverCfg {
+            toml::from_str(&format!("lat = 35.0\nlon = -120.0\ntoga_file = \"x\"\n{s}")).unwrap()
+        };
+        r("timing_sigma_us = 1\nbearing_sigma_deg = 0.5")
+            .validate()
+            .unwrap();
+        assert!(r("timing_sigma_us = 0.001").validate().is_err());
+        assert!(r("bearing_sigma_deg = 0.001").validate().is_err());
     }
 
     #[test]

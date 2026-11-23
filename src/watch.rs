@@ -2,22 +2,47 @@
 //! `dry_mm` of rain in the lookback (from the area's rain stations) raises a critical
 //! dry-lightning alert. With no fresh rain data the alert says so and never calls it
 //! dry. A strike counts as inside when its located center is; strikes marked ambiguous
-//! (two positions fit) don't count.
+//! (two positions fit) or unchecked (three arrival times their bearings spoke against)
+//! don't count. An area around a site is centered wherever the site
+//! is known to be (see `store::site_pos`), and waits until it is known.
 
 use anyhow::Result;
 use ridgewarden_client::alerts::{Alert, Severity};
-use ridgewarden_client::util::short_time;
+use ridgewarden_client::util::{norm_node, short_time};
 use rusqlite::Connection;
 
 use crate::config::{Config, WatchArea};
 use crate::rain::{Verdict, verdict};
-use crate::store::{Strike, strikes_in_box};
+use crate::store::{Strike, site_pos, strikes_in_box};
 
 /// Most strikes looked at per area; beyond this the alert says "more than".
 pub const AREA_MAX: usize = 5000;
 
-pub struct AreaView<'a> {
-    pub area: &'a WatchArea,
+/// The area as it lies on the map: a site's circle gets the site's position for its
+/// center. None for a site whose position isn't known yet.
+pub fn place(conn: &Connection, area: &WatchArea) -> Result<Option<WatchArea>> {
+    let Some(site) = &area.site else {
+        return Ok(Some(area.clone()));
+    };
+    Ok(site_pos(conn, &norm_node(site))?.map(|p| WatchArea {
+        center: Some([p.lat, p.lon]),
+        ..area.clone()
+    }))
+}
+
+/// Every area that can be placed yet.
+pub fn placed(conn: &Connection, areas: &[WatchArea]) -> Result<Vec<WatchArea>> {
+    let mut out = vec![];
+    for a in areas {
+        out.extend(place(conn, a)?);
+    }
+    Ok(out)
+}
+
+pub struct AreaView {
+    /// placed, or as configured while its site's position is unknown
+    pub area: WatchArea,
+    pub placed: bool,
     /// strikes inside in the alert window, newest first
     pub strikes: Vec<Strike>,
     /// there were more than AREA_MAX strikes around the area; only the newest are here
@@ -25,21 +50,32 @@ pub struct AreaView<'a> {
     pub rain: Verdict,
 }
 
-pub fn views<'a>(conn: &Connection, cfg: &'a Config, now: i64) -> Result<Vec<AreaView<'a>>> {
+pub fn views(conn: &Connection, cfg: &Config, now: i64) -> Result<Vec<AreaView>> {
     let from = (now - cfg.watch_window_min as i64 * 60_000) * 1000;
     let to = (now + 600_000) * 1000;
     cfg.watch
         .iter()
-        .map(|area| {
+        .map(|configured| {
+            let rain = verdict(conn, cfg.rain.as_ref(), &configured.rain_stations, now)?;
+            let Some(area) = place(conn, configured)? else {
+                return Ok(AreaView {
+                    area: configured.clone(),
+                    placed: false,
+                    strikes: vec![],
+                    capped: false,
+                    rain,
+                });
+            };
             let around = strikes_in_box(conn, from, to, area.bbox(), AREA_MAX)?;
             Ok(AreaView {
-                area,
                 capped: around.len() == AREA_MAX,
                 strikes: around
                     .into_iter()
-                    .filter(|s| !s.ambiguous && area.contains(s.pos))
+                    .filter(|s| !s.ambiguous && !s.unchecked && area.contains(s.pos))
                     .collect(),
-                rain: verdict(conn, cfg.rain.as_ref(), &area.rain_stations, now)?,
+                area,
+                placed: true,
+                rain,
             })
         })
         .collect()
@@ -133,12 +169,17 @@ mod tests {
             az_deg: 10.0,
             rms_us: None,
             ambiguous: false,
+            unchecked: false,
             sites: ["tst-a", "tst-b", "tst-c"]
                 .iter()
                 .map(|s| Arrival {
                     site: s.to_string(),
                     t_us: (NOW - 60_000) * 1000,
                     resid_us: 0.0,
+                    impulse: None,
+                    bearing_deg: None,
+                    bearing_resid_deg: None,
+                    bearing_left_out: false,
                 })
                 .collect(),
         };
@@ -166,6 +207,7 @@ mod tests {
                         az_deg: 0.0,
                         rms_us: None,
                         ambiguous: false,
+                        unchecked: false,
                         sites: vec![],
                     });
                     v["sites"] = json!([["tst-a", 0, 0.0], ["tst-b", 0, 0.0], ["tst-c", 0, 0.0]]);
@@ -225,6 +267,20 @@ mod tests {
     }
 
     #[test]
+    fn unchecked_or_ambiguous_strikes_raise_nothing() {
+        let c = cfg();
+        for flag in ["unchecked", "ambiguous"] {
+            let f = with_strike_at(LatLon::new(35.01, -120.01));
+            let raised = |f: &Fake| alerts(&views(&f.conn, &c, NOW).unwrap(), &c, &|_| false);
+            assert_eq!(raised(&f).len(), 1);
+            f.conn
+                .execute(&format!("UPDATE strikes SET {flag} = 1"), [])
+                .unwrap();
+            assert!(raised(&f).is_empty(), "{flag}");
+        }
+    }
+
+    #[test]
     fn strikes_outside_every_area_or_too_old_raise_nothing() {
         let f = with_strike_at(LatLon::new(36.3, -120.7));
         let c = cfg();
@@ -240,5 +296,59 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    fn near_sites() -> Config {
+        toml::from_str(
+            r#"
+            [[watch]]
+            name = "Near A"
+            site = "TST-A"
+            radius_km = 10
+            [[watch]]
+            name = "Near the hub"
+            site = "tst-hub"
+            radius_km = 10
+            [[watch]]
+            name = "Near nowhere"
+            site = "tst-gone"
+            radius_km = 50
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_strike_near_a_site_alerts_for_that_site() {
+        // tst-a's receiver is 7 km from the strike, the hub's node about 27 km
+        let mut f = with_strike_at(LatLon::new(35.3, -120.7));
+        f.add(
+            "lightning.toga",
+            json!({"site": "tst-a", "lat": 35.3, "lon": -120.623, "sigma_us": 20.0,
+                   "gps": "locked", "togas": []}),
+            NOW,
+        );
+        f.add(
+            "node.poll",
+            json!({"node": "tst-hub", "ok": true, "lat": 35.3, "lon": -120.4}),
+            NOW,
+        );
+        let c = near_sites();
+        let v = views(&f.conn, &c, NOW).unwrap();
+        assert_eq!(
+            v.iter()
+                .map(|v| (v.placed, v.strikes.len()))
+                .collect::<Vec<_>>(),
+            vec![(true, 1), (true, 0), (false, 0)]
+        );
+        let a = alerts(&v, &c, &|_| false);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].key, "strike:Near A");
+        // the hub's circle reaches the strike once it is bigger
+        let mut c = near_sites();
+        c.watch[1].radius_km = Some(30.0);
+        let a = alerts(&views(&f.conn, &c, NOW).unwrap(), &c, &|_| false);
+        assert_eq!(a.len(), 2);
+        assert_eq!(placed(&f.conn, &c.watch).unwrap().len(), 2);
     }
 }

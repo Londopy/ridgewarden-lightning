@@ -4,7 +4,7 @@
 //! ellipse is small and round; outside it stretches along the line back to the network.
 
 use crate::geo::{LatLon, centroid, in_polygon, local_km};
-use crate::solve::expected;
+use crate::solve::{Rx, expected};
 
 /// Upper edges of the accuracy classes, km (95% semi-major axis); beyond the last is
 /// the worst class.
@@ -76,9 +76,9 @@ pub struct Summary {
     pub worst_km: f64,
 }
 
-/// Expected accuracy over a 30 x 30 grid of points inside `hull`, for receivers given as
-/// (position, timing error in seconds). None if the network can't fix points there.
-pub fn ring_summary(sites: &[(LatLon, f64)], v: f64, hull: &[LatLon]) -> Option<Summary> {
+/// Expected accuracy over a 30 x 30 grid of points inside `hull`. None if the network
+/// can't fix points there.
+pub fn ring_summary(sites: &[Rx], v: f64, hull: &[LatLon]) -> Option<Summary> {
     let (s, n, w, e) = hull.iter().fold(
         (f64::MAX, f64::MIN, f64::MAX, f64::MIN),
         |(s, n, w, e), p| (s.min(p.lat), n.max(p.lat), w.min(p.lon), e.max(p.lon)),
@@ -112,19 +112,19 @@ pub fn ring_summary(sites: &[(LatLon, f64)], v: f64, hull: &[LatLon]) -> Option<
 /// The ring's accuracy with each receiver left out in turn, worst loss first: which site
 /// the network can least afford to lose.
 pub fn without_each(
-    sites: &[(String, LatLon, f64)],
+    sites: &[(String, Rx)],
     v: f64,
     hull: &[LatLon],
 ) -> Vec<(String, Option<Summary>)> {
     let mut out: Vec<(String, Option<Summary>)> = sites
         .iter()
         .enumerate()
-        .map(|(i, (name, _, _))| {
-            let rest: Vec<(LatLon, f64)> = sites
+        .map(|(i, (name, _))| {
+            let rest: Vec<Rx> = sites
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| *j != i)
-                .map(|(_, (_, p, s))| (*p, *s))
+                .map(|(_, (_, rx))| *rx)
                 .collect();
             (name.clone(), ring_summary(&rest, v, hull))
         })
@@ -138,7 +138,7 @@ pub fn without_each(
 
 /// The worst expected accuracy over a set of points (an area's samples); None if the
 /// receivers can't fix one of them.
-pub fn area_worst(sites: &[(LatLon, f64)], v: f64, pts: &[LatLon]) -> Option<f64> {
+pub fn area_worst(sites: &[Rx], v: f64, pts: &[LatLon]) -> Option<f64> {
     pts.iter()
         .map(|p| expected(sites, v, *p).map(|e| e.major_km))
         .try_fold(0.0f64, |w, k| k.map(|k| w.max(k)))
@@ -164,29 +164,40 @@ mod tests {
         assert!(hull(&pts[..2]).is_empty());
     }
 
+    fn rxs(sigma: f64, bearing_sigma: Option<f64>) -> Vec<Rx> {
+        ring()
+            .iter()
+            .map(|p| Rx {
+                pos: *p,
+                sigma,
+                bearing_sigma,
+            })
+            .collect()
+    }
+
     #[test]
     fn accuracy_inside_the_ring_scales_with_timing_error() {
         let h = hull(&ring());
-        let at = |sigma: f64| {
-            let s: Vec<(LatLon, f64)> = ring().iter().map(|p| (*p, sigma)).collect();
-            ring_summary(&s, V, &h).unwrap()
-        };
+        let at = |sigma: f64| ring_summary(&rxs(sigma, None), V, &h).unwrap();
         let (fine, coarse) = (at(5e-6), at(20e-6));
         assert!(fine.points > 100);
         assert!(fine.best_km <= fine.median_km && fine.median_km <= fine.worst_km);
         assert!((coarse.median_km / fine.median_km - 4.0).abs() < 0.01);
         // this 4-site, ~50 km network meets the spec's 1-3 km target with 2 us timing, not with 5
         assert!(at(2e-6).median_km < 3.0 && fine.median_km > 3.0, "{fine:?}");
+        // bearings of 2 degrees bring it under 3 km with the 5 us
+        let loops = ring_summary(&rxs(5e-6, Some(2f64.to_radians())), V, &h).unwrap();
+        assert!(loops.median_km < 3.0, "{loops:?}");
     }
 
     #[test]
     fn losing_a_site_makes_the_ring_worse() {
-        let named: Vec<(String, LatLon, f64)> = ring()
-            .iter()
+        let named: Vec<(String, Rx)> = rxs(5e-6, None)
+            .into_iter()
             .enumerate()
-            .map(|(i, p)| (format!("tst-{i}"), *p, 5e-6))
+            .map(|(i, rx)| (format!("tst-{i}"), rx))
             .collect();
-        let all: Vec<(LatLon, f64)> = named.iter().map(|(_, p, s)| (*p, *s)).collect();
+        let all: Vec<Rx> = named.iter().map(|(_, rx)| *rx).collect();
         let h = hull(&ring());
         let full = ring_summary(&all, V, &h).unwrap();
         let w = without_each(&named, V, &h);

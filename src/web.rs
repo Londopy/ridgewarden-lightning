@@ -16,6 +16,7 @@ use ridgewarden_client::util::{esc, human_duration, ms_to_rfc3339, now_ms, short
 use serde_json::{Value, json};
 
 use crate::app::{App, NAME};
+use crate::config::WatchArea;
 use crate::coverage;
 use crate::geo::LatLon;
 use crate::map::{self, Map};
@@ -95,6 +96,12 @@ pub fn receiver_state(r: &Receiver, fit: Option<&SiteFit>, now: i64) -> (Color, 
     {
         return (Color::Yellow, format!("timing looks {m:+.0} us off"));
     }
+    if let Some(m) = fit.and_then(|f| f.turned(r.bearing_sigma_deg.unwrap_or(0.0))) {
+        return (
+            Color::Yellow,
+            format!("bearings look {m:+.0} deg off, left out of fits"),
+        );
+    }
     (Color::Green, "receiving".into())
 }
 
@@ -165,12 +172,29 @@ fn areas_section(app: &App, now: i64) -> Result<String, Fail> {
             Verdict::Wet { .. } => pill(Color::Green, "wet"),
             Verdict::Missing(_) => pill(Color::Unknown, "no data"),
         };
+        let strikes = match (&v.area.site, v.placed) {
+            (Some(site), false) => format!(
+                "{} <span class=\"mute small\">no position for {} yet: no receiver report or node poll</span>",
+                pill(Color::Unknown, "waiting"),
+                esc(site)
+            ),
+            _ => format!(
+                "{}{}",
+                if v.capped { "more than " } else { "" },
+                v.strikes.len()
+            ),
+        };
+        let within = match (&v.area.site, v.area.radius_km) {
+            (Some(site), Some(r)) => format!(
+                " <span class=\"mute small\">within {r} km of {}</span>",
+                esc(&app.cfg.label(&ridgewarden_client::util::norm_node(site)))
+            ),
+            _ => String::new(),
+        };
         let _ = write!(
             b,
-            "<tr><td>{}</td><td>{}{}</td><td>{rain} {}</td></tr>",
+            "<tr><td>{}{within}</td><td>{strikes}</td><td>{rain} {}</td></tr>",
             esc(&v.area.name),
-            if v.capped { "more than " } else { "" },
-            v.strikes.len(),
             esc(&v.rain.text(app.cfg.rain.as_ref()))
         );
     }
@@ -199,6 +223,21 @@ fn receivers_table(app: &App, rx: &[Receiver], fits: &Fits, now: i64) -> String 
             .and_then(|f| f.median_us)
             .map(|m| format!("<br><span class=\"mute small\">median residual {m:+.1} us</span>"))
             .unwrap_or_default();
+        let bearing = r
+            .bearing_sigma_deg
+            .map(|s| {
+                let m = fit
+                    .and_then(|f| f.bearing_median_deg)
+                    .map(|m| format!(", median residual {m:+.1} deg"))
+                    .unwrap_or_default();
+                let out = if fit.and_then(|f| f.turned(s)).is_some() {
+                    ", left out of fits"
+                } else {
+                    ""
+                };
+                format!("<br><span class=\"mute small\">bearings {s} deg{m}{out}</span>")
+            })
+            .unwrap_or_default();
         let err = r
             .error
             .as_ref()
@@ -223,7 +262,7 @@ fn receivers_table(app: &App, rx: &[Receiver], fits: &Fits, now: i64) -> String 
         let _ = write!(
             b,
             "<tr><td>{}</td><td>{}{err}</td><td>{}</td><td>{}{dropped}</td><td>{}</td><td>{part}</td>\
-             <td>{:.0} us{median}</td><td class=small>{:.4}, {:.4}</td></tr>",
+             <td>{:.0} us{median}{bearing}</td><td class=small>{:.4}, {:.4}</td></tr>",
             esc(&app.cfg.label(&r.site)),
             pill(color, &why),
             esc(gps),
@@ -238,7 +277,7 @@ fn receivers_table(app: &App, rx: &[Receiver], fits: &Fits, now: i64) -> String 
     b
 }
 
-fn strike_rows(app: &App, strikes: &[Strike], ring: &[LatLon], b: &mut String) {
+fn strike_rows(strikes: &[Strike], areas: &[WatchArea], ring: &[LatLon], b: &mut String) {
     b.push_str(
         "<div class=wrap><table><tr><th>Time</th><th>Position</th><th>95% ellipse</th><th>Sites</th>\
          <th>Fit</th><th>Areas</th></tr>",
@@ -248,9 +287,7 @@ fn strike_rows(app: &App, strikes: &[Strike], ring: &[LatLon], b: &mut String) {
             Some(r) => format!("{r:.1} us RMS"),
             None => "exact (3 sites)".into(),
         };
-        let areas: Vec<String> = app
-            .cfg
-            .watch
+        let areas: Vec<String> = areas
             .iter()
             .filter(|a| a.contains(s.pos))
             .map(|a| esc(&a.name))
@@ -273,10 +310,12 @@ fn strike_rows(app: &App, strikes: &[Strike], ring: &[LatLon], b: &mut String) {
     b.push_str("</table></div>");
 }
 
-/// "(ambiguous)" or "(outside the ring)" after a position, where it applies.
+/// "(ambiguous)", "(unchecked)" or "(outside the ring)" after a position, where it applies.
 fn note(s: &Strike, ring: &[LatLon]) -> &'static str {
     if s.ambiguous {
         " <span class=\"mute small\">(ambiguous)</span>"
+    } else if s.unchecked {
+        " <span class=\"mute small\">(unchecked)</span>"
     } else if !ring.is_empty() && !coverage::inside(s.pos, ring) {
         " <span class=\"mute small\">(outside the ring)</span>"
     } else {
@@ -302,8 +341,9 @@ async fn map_page(
     let from_us = (now - h * 3_600_000) * 1000;
     let rx = store::receivers(&app.db(), now)?;
     let ring = ring_of(&rx);
-    let (fits, _) = store::fits(&app.db(), (now - 7 * 86_400_000) * 1000)?;
+    let fits = store::fits(&app.db(), (now - 7 * 86_400_000) * 1000)?.sites;
     let strikes = store::strikes(&app.db(), from_us, i64::MAX, MAP_MAX)?;
+    let areas = watch::placed(&app.db(), &app.cfg.watch)?;
     let mut b = format!(
         "<h1>Lightning</h1><p class=\"mute small\">Strikes located from the arrival times of each strike's radio \
          pulse (sferic) at the VLF receivers. Ellipses show where each strike is with 95% confidence.</p><style>{}</style>",
@@ -330,7 +370,7 @@ async fn map_page(
     let m = Map {
         receivers: &rx,
         strikes: &strikes,
-        areas: &app.cfg.watch,
+        areas: &areas,
         now_us: now * 1000,
         ring: &ring,
         coverage: None,
@@ -354,15 +394,23 @@ async fn map_page(
     } else {
         let _ = write!(b, "<p>{} strikes in this period.", strikes.len());
     }
+    let min = app.cfg.solver.min_sites;
     if !app.cfg.solver.enabled {
         b.push_str(" <span class=\"mute small\">This site doesn't run the solver; strikes come from the site that does.</span>");
+    } else if rx.len() < min {
+        let _ = write!(
+            b,
+            " <span class=\"mute small\">The solver needs {min} receivers to hear a strike (min_sites) and {} reported this week; \
+             a network of three sets min_sites = 3.</span>",
+            rx.len()
+        );
     }
     b.push_str("</p>");
     b.push_str(&areas_section(&app, now)?);
     b.push_str(&receivers_table(&app, &rx, &fits, now));
     if !strikes.is_empty() {
         b.push_str("<h2>Latest strikes</h2>");
-        strike_rows(&app, &strikes[..strikes.len().min(10)], &ring, &mut b);
+        strike_rows(&strikes[..strikes.len().min(10)], &areas, &ring, &mut b);
         b.push_str("<p><a href=\"/strikes\">All strikes</a></p>");
     }
     Ok(page(&app, "/", "Lightning", &b, true).await)
@@ -382,11 +430,12 @@ async fn history_page(
         .unwrap_or(i64::MAX);
     let strikes = store::strikes(&app.db(), i64::MIN, before, PAGE)?;
     let ring = ring_of(&store::receivers(&app.db(), now_ms())?);
+    let areas = watch::placed(&app.db(), &app.cfg.watch)?;
     let mut b = String::from("<h1>Strikes</h1>");
     if strikes.is_empty() {
         b.push_str("<p class=mute>No strikes located yet.</p>");
     } else {
-        strike_rows(&app, &strikes, &ring, &mut b);
+        strike_rows(&strikes, &areas, &ring, &mut b);
     }
     if strikes.len() == PAGE
         && let Some(last) = strikes.last()
@@ -421,9 +470,14 @@ async fn strike_page(
     let now = now_ms();
     let rx = store::receivers(&app.db(), now)?;
     let ring = ring_of(&rx);
+    let used = s
+        .sites
+        .iter()
+        .filter(|a| a.bearing_deg.is_some() && !a.bearing_left_out)
+        .count();
     let mut b = format!(
         "<h1>Strike at {}</h1><style>{}</style><p>{:.5}, {:.5}. The strike is inside an ellipse {:.2} km by {:.2} km \
-         (semi-axes), its long axis at {:.0} degrees from north, with 95% confidence, if each receiver's timing is as good \
+         (semi-axes), its long axis at {:.0} degrees from north, with 95% confidence, if each receiver's {} as good \
          as configured.</p>",
         esc(&strike_time(s.t_us)),
         map::CSS,
@@ -431,26 +485,49 @@ async fn strike_page(
         s.pos.lon,
         s.major_km,
         s.minor_km,
-        s.az_deg
+        s.az_deg,
+        if used > 0 {
+            "timing and bearings are"
+        } else {
+            "timing is"
+        }
     );
+    let bearings = match used {
+        0 => String::new(),
+        1 => " and a bearing".into(),
+        n => format!(" and {n} bearings"),
+    };
     match s.rms_us {
         Some(r) => {
             let _ = write!(
                 b,
-                "<p>{} receivers: more than the three unknowns (position and time), so the residuals below show how \
-                 well the arrivals fit one strike: {r:.1} us RMS.</p>",
+                "<p>{} receivers{bearings}: more measurements than the three unknowns (position and time), so the \
+                 residuals below show how well they fit one strike: {r:.1} us RMS in arrival time.</p>",
                 s.sites.len()
             );
         }
         None => b.push_str(
-            "<p>Three receivers: exactly as many arrival times as unknowns, so the fit is exact and nothing checks it. \
-             The ellipse comes from the receivers' geometry and timing alone.</p>",
+            "<p>Three receivers and no bearing in the fit: exactly as many arrival times as unknowns, so the fit is \
+             exact and nothing checks it. The ellipse comes from the receivers' geometry and timing alone.</p>",
         ),
+    }
+    if s.sites.iter().any(|a| a.bearing_left_out) {
+        b.push_str(
+            "<p>Some bearings are left out of the fit (marked below): either they don't fit with these arrival times, \
+             or their site's bearings have been off for a while (see the receiver table). Their residuals show how \
+             far each receiver's loops point from the strike; a site whose bearings are often far off needs its loop \
+             alignment in vttoga's <code>-p</code> checked.</p>",
+        );
     }
     if s.ambiguous {
         b.push_str(
-            "<p class=banner>Ambiguous: another position fits these three arrival times just as well. \
-             A fourth receiver would settle it.</p>",
+            "<p class=banner>Ambiguous: another position fits these measurements just as well. \
+             A fourth receiver, or a bearing from crossed loops, would settle it.</p>",
+        );
+    } else if s.unchecked {
+        b.push_str(
+            "<p class=banner>Unchecked: these three arrival times only fit once their bearings were left out, so \
+             nothing checks this strike and the bearings speak against it. It raises no alert.</p>",
         );
     } else if !ring.is_empty() && !coverage::inside(s.pos, &ring) {
         b.push_str(
@@ -462,10 +539,11 @@ async fn strike_page(
         .into_iter()
         .filter(|r| s.sites.iter().any(|a| a.site == r.site))
         .collect();
+    let areas = watch::placed(&app.db(), &app.cfg.watch)?;
     let m = Map {
         receivers: &near,
         strikes: std::slice::from_ref(&s),
-        areas: &app.cfg.watch,
+        areas: &areas,
         now_us: now * 1000,
         ring: &ring,
         coverage: None,
@@ -473,20 +551,64 @@ async fn strike_page(
     if let Some(svg) = map::render(&m, &|x| app.cfg.label(x)) {
         b.push_str(&svg);
     }
-    b.push_str("<h2>Arrivals</h2><div class=wrap><table><tr><th>Site</th><th>Arrival</th><th>After the strike</th><th>Residual</th></tr>");
+    b.push_str(&arrivals_table(&app, &s));
+    b.push_str("<p><a href=\"/strikes\">All strikes</a></p>");
+    Ok(page(&app, "", "Strike", &b, false).await.into_response())
+}
+
+/// Each receiver's arrival with its residual, and its impulse ratio and bearing where
+/// the receiver gave them.
+fn arrivals_table(app: &App, s: &Strike) -> String {
+    let impulse = s.sites.iter().any(|a| a.impulse.is_some());
+    let bearing = s.sites.iter().any(|a| a.bearing_deg.is_some());
+    // round first so a tiny negative residual doesn't show as "-0.0"
+    let tenth = |x: f64| (x * 10.0).round() / 10.0 + 0.0;
+    let mut b = String::from(
+        "<h2>Arrivals</h2><div class=wrap><table><tr><th>Site</th><th>Arrival</th><th>After the strike</th><th>Residual</th>",
+    );
+    if impulse {
+        b.push_str("<th>Impulse ratio</th>");
+    }
+    if bearing {
+        b.push_str("<th>Bearing</th><th>Bearing residual</th>");
+    }
+    b.push_str("</tr>");
     for a in &s.sites {
         let _ = write!(
             b,
-            "<tr><td>{}</td><td>{}</td><td>{} us</td><td>{:.1} us</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{} us</td><td>{:.1} us</td>",
             esc(&app.cfg.label(&a.site)),
             esc(&strike_time(a.t_us)),
             a.t_us - s.t_us,
-            // round first so a tiny negative residual doesn't show as "-0.0"
-            (a.resid_us * 10.0).round() / 10.0 + 0.0
+            tenth(a.resid_us)
         );
+        let or_dash = |v: Option<String>| v.unwrap_or_else(|| "-".into());
+        if impulse {
+            let _ = write!(
+                b,
+                "<td>{}</td>",
+                or_dash(a.impulse.map(|i| format!("{i:.2}")))
+            );
+        }
+        if bearing {
+            let _ = write!(
+                b,
+                "<td>{}</td><td>{}</td>",
+                or_dash(a.bearing_deg.map(|d| {
+                    let out = if a.bearing_left_out {
+                        " (left out)"
+                    } else {
+                        ""
+                    };
+                    format!("{d:.1} deg{out}")
+                })),
+                or_dash(a.bearing_resid_deg.map(|r| format!("{:.1} deg", tenth(r))))
+            );
+        }
+        b.push_str("</tr>");
     }
-    b.push_str("</table></div><p><a href=\"/strikes\">All strikes</a></p>");
-    Ok(page(&app, "", "Strike", &b, false).await.into_response())
+    b.push_str("</table></div>");
+    b
 }
 
 async fn ack_page(State(app): State<Arc<App>>, Path(token): Path<String>) -> Html<String> {
@@ -529,6 +651,7 @@ pub fn feature_collection(strikes: &[Strike]) -> Value {
                 "time": strike_time(s.t_us), "t_us": s.t_us,
                 "major_km": s.major_km, "minor_km": s.minor_km, "az_deg": s.az_deg,
                 "confidence": 0.95, "rms_us": s.rms_us, "ambiguous": s.ambiguous,
+                "unchecked": s.unchecked,
                 "sites": s.sites.iter().map(|a| &a.site).collect::<Vec<_>>(),
             },
         })).collect::<Vec<_>>(),
@@ -551,13 +674,14 @@ async fn geojson(
 /// Strikes as CSV, one per line, oldest first: for spreadsheets and the personal
 /// weather model.
 pub fn csv_text(strikes: &[Strike]) -> String {
-    let mut out =
-        String::from("time_utc,t_us,lat,lon,major_km,minor_km,az_deg,sites,rms_us,ambiguous\n");
+    let mut out = String::from(
+        "time_utc,t_us,lat,lon,major_km,minor_km,az_deg,sites,rms_us,ambiguous,unchecked\n",
+    );
     for s in strikes.iter().rev() {
         let t = ms_to_rfc3339(s.t_us.div_euclid(1000));
         let _ = writeln!(
             out,
-            "{},{},{:.6},{:.6},{:.3},{:.3},{:.1},{},{},{}",
+            "{},{},{:.6},{:.6},{:.3},{:.3},{:.1},{},{},{},{}",
             t,
             s.t_us,
             s.pos.lat,
@@ -567,7 +691,8 @@ pub fn csv_text(strikes: &[Strike]) -> String {
             s.az_deg,
             s.sites.len(),
             s.rms_us.map(|r| format!("{r:.2}")).unwrap_or_default(),
-            s.ambiguous
+            s.ambiguous,
+            s.unchecked
         );
     }
     out
@@ -589,7 +714,7 @@ async fn csv(
 async fn receivers_json(State(app): State<Arc<App>>) -> Result<Json<Value>, Fail> {
     let now = now_ms();
     let rx = store::receivers(&app.db(), now)?;
-    let (fits, _) = store::fits(&app.db(), (now - 7 * 86_400_000) * 1000)?;
+    let fits = store::fits(&app.db(), (now - 7 * 86_400_000) * 1000)?.sites;
     Ok(Json(json!({
         "generated": now,
         "receivers": rx.iter().map(|r| json!({
@@ -597,9 +722,12 @@ async fn receivers_json(State(app): State<Arc<App>>) -> Result<Json<Value>, Fail
             "gps": r.gps, "state": receiver_state(r, fits.get(&r.site), now).1,
             "last_report_ms": r.last_ts, "last_sferic_us": r.last_toga_us,
             "sferics_last_hour": r.hour_n, "dropped_last_hour": r.hour_dropped, "error": r.error,
-            "clock_s": r.clock_s,
+            "clock_s": r.clock_s, "bearing_sigma_deg": r.bearing_sigma_deg,
             "strikes_7d": fits.get(&r.site).map_or(0, |f| f.strikes),
             "median_residual_us": fits.get(&r.site).and_then(|f| f.median_us),
+            "median_bearing_residual_deg": fits.get(&r.site).and_then(|f| f.bearing_median_deg),
+            "bearings_left_out": fits.get(&r.site)
+                .and_then(|f| f.turned(r.bearing_sigma_deg.unwrap_or(0.0))).is_some(),
         })).collect::<Vec<_>>(),
     })))
 }
@@ -629,17 +757,37 @@ mod tests {
             hour_dropped: 0,
             error: None,
             clock_s: None,
+            bearing_sigma_deg: Some(5.0),
         };
         assert_eq!(receiver_state(&r, None, 1_060_000).0, Color::Green);
         assert_eq!(
             receiver_state(&r, None, 1_000_000 + SILENT_MS + 1).0,
             Color::Red
         );
+        // loops turned off true north show in the bearing residuals, past the site's error
+        let mut turned = SiteFit {
+            strikes: 30,
+            with_bearings: 20,
+            bearing_median_deg: Some(4.0),
+            ..SiteFit::default()
+        };
+        assert_eq!(receiver_state(&r, Some(&turned), 1_060_000).0, Color::Green);
+        turned.bearing_median_deg = Some(-11.0);
+        assert_eq!(
+            receiver_state(&r, Some(&turned), 1_060_000),
+            (
+                Color::Yellow,
+                "bearings look -11 deg off, left out of fits".into()
+            )
+        );
+        turned.with_bearings = 9;
+        assert_eq!(receiver_state(&r, Some(&turned), 1_060_000).0, Color::Green);
         // consistently late residuals flag the site, once there are enough of them
         let mut fit = SiteFit {
             strikes: 30,
             median_us: Some(35.0),
             with_residuals: 5,
+            ..SiteFit::default()
         };
         assert_eq!(receiver_state(&r, Some(&fit), 1_060_000).0, Color::Green);
         fit.with_residuals = 20;
@@ -670,6 +818,7 @@ mod tests {
             az_deg: 10.0,
             rms_us: None,
             ambiguous: false,
+            unchecked: false,
             sites: vec![],
         };
         let text = csv_text(&[s(2_000_000), s(1_000_000)]);
@@ -690,6 +839,7 @@ mod tests {
             az_deg: 0.0,
             rms_us: None,
             ambiguous: false,
+            unchecked: false,
             sites: vec![],
         };
         let v = feature_collection(&[s]);

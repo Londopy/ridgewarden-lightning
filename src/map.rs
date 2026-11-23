@@ -266,10 +266,15 @@ mod tests {
             az_deg: 0.0,
             rms_us: None,
             ambiguous: false,
+            unchecked: false,
             sites: vec![Arrival {
                 site: "tst-a".into(),
                 t_us,
                 resid_us: 0.0,
+                impulse: None,
+                bearing_deg: None,
+                bearing_resid_deg: None,
+                bearing_left_out: false,
             }],
         }
     }
@@ -286,6 +291,7 @@ mod tests {
             hour_dropped: 0,
             error: None,
             clock_s: None,
+            bearing_sigma_deg: None,
         }
     }
 

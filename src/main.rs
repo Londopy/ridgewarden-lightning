@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use ridgewarden_client::alerts;
 use ridgewarden_lightning::app::{self, App};
 use ridgewarden_lightning::config::{Config, EXAMPLE};
-use ridgewarden_lightning::sim::{self, Plan, Rng};
+use ridgewarden_lightning::sim::{self, Loops, Plan, Rng};
 use ridgewarden_lightning::{agreement, coverage, receiver, store};
 use ridgewarden_lightning::{spawn_loops, web};
 
@@ -48,6 +48,13 @@ enum Cmd {
         /// timing noise added to each arrival, microseconds (1 sigma)
         #[arg(long, default_value_t = 5.0)]
         sigma_us: f64,
+        /// give each record a bearing, as crossed loops would: "axis" (0 to 180) or
+        /// "full" (0 to 360, loops and a whip)
+        #[arg(long)]
+        bearings: Option<String>,
+        /// bearing noise, degrees (1 sigma)
+        #[arg(long, default_value_t = 2.0)]
+        bearing_sigma_deg: f64,
         /// seconds between strikes
         #[arg(long, default_value_t = 2.0)]
         every: f64,
@@ -113,11 +120,19 @@ fn main() -> Result<()> {
             strikes,
             out,
             sigma_us,
+            bearings,
+            bearing_sigma_deg,
             every,
             delay,
             velocity_factor,
             seed,
         } => {
+            let modulus = match bearings.as_deref() {
+                None => None,
+                Some("axis") => Some(180.0),
+                Some("full") => Some(360.0),
+                Some(b) => bail!("--bearings is axis or full, not {b:?}"),
+            };
             let plan = Plan {
                 receivers: receivers
                     .iter()
@@ -129,6 +144,10 @@ fn main() -> Result<()> {
                     .collect::<Result<_>>()?,
                 every_s: every,
                 sigma_us,
+                loops: modulus.map(|modulus| Loops {
+                    modulus,
+                    sigma_deg: bearing_sigma_deg,
+                }),
                 v_km_s: velocity_factor * ridgewarden_lightning::solve::C_KM_S,
                 start_us: (ridgewarden_client::util::now_ms() as f64 * 1000.0 + delay * 1e6) as i64,
             };

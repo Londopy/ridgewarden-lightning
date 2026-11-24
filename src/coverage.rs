@@ -67,6 +67,11 @@ pub fn inside(p: LatLon, hull: &[LatLon]) -> bool {
     hull.len() >= 3 && in_polygon(p, hull)
 }
 
+/// Outside the ring, where accuracy falls off; nothing is while there is no ring.
+pub fn outside(p: LatLon, ring: &[LatLon]) -> bool {
+    !ring.is_empty() && !inside(p, ring)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Summary {
     /// grid points inside the ring that were sampled

@@ -22,7 +22,10 @@ pub mod receiver;
 pub mod sim;
 pub mod solve;
 pub mod store;
+#[cfg(test)]
+mod testing;
 pub mod toga;
+pub mod top;
 pub mod watch;
 pub mod web;
 
@@ -32,17 +35,7 @@ use std::time::Duration;
 use ridgewarden_client::util::now_ms;
 
 async fn alert_round(app: &app::App) -> anyhow::Result<usize> {
-    let active = {
-        let db = app.db();
-        let views = watch::views(&db, &app.cfg, now_ms())?;
-        let open: Vec<String> = ridgewarden_client::alerts::open_alerts(&db)?
-            .into_iter()
-            .map(|a| a.key)
-            .collect();
-        watch::alerts(&views, &app.cfg, &|area| {
-            open.iter().any(|k| *k == format!("dry:{area}"))
-        })
-    };
+    let active = watch::status(&app.db(), &app.cfg, now_ms())?.due;
     ridgewarden_client::alerts::run(
         &app.alert_http,
         &app.db,

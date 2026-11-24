@@ -1,5 +1,5 @@
-//! The map page, strike history, one page per strike, alert acknowledgements, and the
-//! strikes as GeoJSON and CSV. The accuracy page is in `accuracy`.
+//! The map page, strike history, one page per strike, alert acknowledgements, the strikes
+//! as GeoJSON and CSV, and the JSON that `top` reads. The accuracy page is in `accuracy`.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -12,11 +12,12 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ridgewarden_client::alerts;
 use ridgewarden_client::ui::{Color, Page, pill};
-use ridgewarden_client::util::{esc, human_duration, ms_to_rfc3339, now_ms, short_time};
+use ridgewarden_client::util::{esc, human_duration, ms_to_rfc3339, norm_node, now_ms, short_time};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::app::{App, NAME};
-use crate::config::WatchArea;
+use crate::config::{Config, WatchArea};
 use crate::coverage;
 use crate::geo::LatLon;
 use crate::map::{self, Map};
@@ -33,6 +34,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/ack/{token}", get(ack_page).post(ack_post))
         .route("/api/strikes.geojson", get(geojson))
         .route("/api/strikes.csv", get(csv))
+        .route("/api/strikes", get(strikes_json))
+        .route("/api/strike", get(arrivals_json))
+        .route("/api/areas", get(areas_json))
         .route("/api/receivers", get(receivers_json))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(app)
@@ -316,7 +320,7 @@ fn note(s: &Strike, ring: &[LatLon]) -> &'static str {
         " <span class=\"mute small\">(ambiguous)</span>"
     } else if s.unchecked {
         " <span class=\"mute small\">(unchecked)</span>"
-    } else if !ring.is_empty() && !coverage::inside(s.pos, ring) {
+    } else if coverage::outside(s.pos, ring) {
         " <span class=\"mute small\">(outside the ring)</span>"
     } else {
         ""
@@ -529,7 +533,7 @@ async fn strike_page(
             "<p class=banner>Unchecked: these three arrival times only fit once their bearings were left out, so \
              nothing checks this strike and the bearings speak against it. It raises no alert.</p>",
         );
-    } else if !ring.is_empty() && !coverage::inside(s.pos, &ring) {
+    } else if coverage::outside(s.pos, &ring) {
         b.push_str(
             "<p class=banner>Outside the ring of receivers. Accuracy falls off out here, and the real \
              uncertainty bends away from the network more than the ellipse shows.</p>",
@@ -712,29 +716,174 @@ async fn csv(
 }
 
 async fn receivers_json(State(app): State<Arc<App>>) -> Result<Json<Value>, Fail> {
-    let now = now_ms();
-    let rx = store::receivers(&app.db(), now)?;
-    let fits = store::fits(&app.db(), (now - 7 * 86_400_000) * 1000)?.sites;
-    Ok(Json(json!({
+    Ok(Json(receivers_value(&app.db(), &app.cfg, now_ms())?))
+}
+
+/// Every receiver that reported this week, with the state and color the map page gives it.
+fn receivers_value(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Value> {
+    let rx = store::receivers(conn, now)?;
+    let fits = store::fits(conn, (now - 7 * 86_400_000) * 1000)?.sites;
+    Ok(json!({
         "generated": now,
-        "receivers": rx.iter().map(|r| json!({
-            "site": r.site, "lat": r.pos.lat, "lon": r.pos.lon, "sigma_us": r.sigma_us,
-            "gps": r.gps, "state": receiver_state(r, fits.get(&r.site), now).1,
-            "last_report_ms": r.last_ts, "last_sferic_us": r.last_toga_us,
-            "sferics_last_hour": r.hour_n, "dropped_last_hour": r.hour_dropped, "error": r.error,
-            "clock_s": r.clock_s, "bearing_sigma_deg": r.bearing_sigma_deg,
-            "strikes_7d": fits.get(&r.site).map_or(0, |f| f.strikes),
-            "median_residual_us": fits.get(&r.site).and_then(|f| f.median_us),
-            "median_bearing_residual_deg": fits.get(&r.site).and_then(|f| f.bearing_median_deg),
-            "bearings_left_out": fits.get(&r.site)
-                .and_then(|f| f.turned(r.bearing_sigma_deg.unwrap_or(0.0))).is_some(),
-        })).collect::<Vec<_>>(),
-    })))
+        "receivers": rx.iter().map(|r| {
+            let fit = fits.get(&r.site);
+            let (color, state) = receiver_state(r, fit, now);
+            json!({
+                "site": r.site, "label": cfg.label(&r.site), "lat": r.pos.lat, "lon": r.pos.lon,
+                "sigma_us": r.sigma_us, "gps": r.gps, "state": state, "color": color.css(),
+                "last_report_ms": r.last_ts, "last_sferic_us": r.last_toga_us,
+                "sferics_last_hour": r.hour_n, "dropped_last_hour": r.hour_dropped, "error": r.error,
+                "clock_s": r.clock_s, "bearing_sigma_deg": r.bearing_sigma_deg,
+                "strikes_7d": fit.map_or(0, |f| f.strikes),
+                "median_residual_us": fit.and_then(|f| f.median_us),
+                "median_bearing_residual_deg": fit.and_then(|f| f.bearing_median_deg),
+                "bearings_left_out": fit
+                    .and_then(|f| f.turned(r.bearing_sigma_deg.unwrap_or(0.0))).is_some(),
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+async fn strikes_json(
+    State(app): State<Arc<App>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, Fail> {
+    let limit = q
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(100)
+        .clamp(1, MAP_MAX);
+    Ok(Json(strikes_value(
+        &app.db(),
+        &app.cfg,
+        now_ms(),
+        hours(&q),
+        limit,
+    )?))
+}
+
+/// The newest `limit` strikes of the last `h` hours and how many there were in all. Each
+/// one's arrivals are left to `/api/strike`: a list read every couple of seconds doesn't
+/// need them.
+fn strikes_value(
+    conn: &Connection,
+    cfg: &Config,
+    now: i64,
+    h: i64,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let from_us = (now - h * 3_600_000) * 1000;
+    let areas = watch::placed(conn, &cfg.watch)?;
+    let strikes = store::strikes(conn, from_us, i64::MAX, limit)?;
+    Ok(json!({
+        "generated": now,
+        "hours": h,
+        "total": store::count_strikes(conn, from_us)?,
+        "solver": {"enabled": cfg.solver.enabled, "min_sites": cfg.solver.min_sites},
+        "strikes": strikes.iter().map(|s| strike_row(s, &areas)).collect::<Vec<_>>(),
+    }))
+}
+
+/// What the strike page says about a strike, without its arrivals: the watch areas it's
+/// in, and how many receivers and bearings went into its fit.
+fn strike_row(s: &Strike, areas: &[WatchArea]) -> Value {
+    json!({
+        "id": s.id, "time": strike_time(s.t_us), "t_us": s.t_us,
+        "lat": s.pos.lat, "lon": s.pos.lon,
+        "major_km": s.major_km, "minor_km": s.minor_km, "az_deg": s.az_deg,
+        "rms_us": s.rms_us, "ambiguous": s.ambiguous, "unchecked": s.unchecked,
+        "areas": areas.iter().filter(|a| a.contains(s.pos)).map(|a| &a.name).collect::<Vec<_>>(),
+        "site_count": s.sites.len(),
+        "bearings_in_fit": s.sites.iter().filter(|a| a.bearing_used()).count(),
+    })
+}
+
+/// One strike with each receiver's arrival, or null for an id that isn't here.
+async fn arrivals_json(
+    State(app): State<Arc<App>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, Fail> {
+    let db = app.db();
+    let Some(s) = store::strike(&db, q.get("id").map_or("", String::as_str))? else {
+        return Ok(Json(Value::Null));
+    };
+    let mut v = strike_row(&s, &watch::placed(&db, &app.cfg.watch)?);
+    v["sites"] = s
+        .sites
+        .iter()
+        .map(|a| {
+            json!({
+                "site": a.site, "label": app.cfg.label(&a.site), "t_us": a.t_us,
+                "resid_us": a.resid_us, "impulse": a.impulse, "bearing_deg": a.bearing_deg,
+                "bearing_resid_deg": a.bearing_resid_deg, "bearing_left_out": a.bearing_left_out,
+            })
+        })
+        .collect();
+    Ok(Json(v))
+}
+
+async fn areas_json(State(app): State<Arc<App>>) -> Result<Json<Value>, Fail> {
+    Ok(Json(areas_value(&app.db(), &app.cfg, now_ms())?))
+}
+
+/// Each watch area: its strikes in the alert window, its rain, the alert the rules call
+/// for now ("dry", "lightning", "quiet", or "waiting" for a site's position), and the
+/// alert that is open for it.
+fn areas_value(conn: &Connection, cfg: &Config, now: i64) -> anyhow::Result<Value> {
+    let st = watch::status(conn, cfg, now)?;
+    Ok(json!({
+        "generated": now,
+        "window_min": cfg.watch_window_min,
+        "areas": st.views.iter().map(|v| {
+            let keys = watch::keys(&v.area.name);
+            let state = match st.due.iter().find(|a| keys.contains(&a.key)) {
+                Some(a) if a.severity == alerts::Severity::Critical => "dry",
+                Some(_) => "lightning",
+                None if !v.placed => "waiting",
+                None => "quiet",
+            };
+            let alert = keys.iter().find_map(|k| st.open.iter().find(|a| a.key == *k));
+            json!({
+                "name": v.area.name,
+                "site": v.area.site.as_deref().map(norm_node),
+                "site_label": v.area.site.as_deref().map(|s| cfg.label(&norm_node(s))),
+                "center": v.area.center, "radius_km": v.area.radius_km,
+                "corners": v.area.polygon.len(),
+                "placed": v.placed, "strikes": v.strikes.len(), "capped": v.capped,
+                "latest_us": v.strikes.first().map(|s| s.t_us),
+                "state": state,
+                "rain": rain_value(&v.rain, cfg),
+                "alert": alert.map(|a| json!({
+                    "severity": a.severity, "title": a.title, "text": a.text,
+                    "opened_ms": a.opened_ms, "acked": a.acked,
+                })),
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+fn rain_value(v: &Verdict, cfg: &Config) -> Value {
+    let (verdict, reading) = match v {
+        Verdict::Dry { mm, station, .. } => ("dry", Some((mm, station))),
+        Verdict::Wet { mm, station, .. } => ("wet", Some((mm, station))),
+        Verdict::Missing(_) => ("missing", None),
+    };
+    json!({
+        "verdict": verdict,
+        "mm": reading.map(|r| r.0),
+        "station": reading.map(|r| r.1),
+        "text": v.text(cfg.rain.as_ref()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use ridgewarden_client::tui::Fetch;
+
+    use crate::testing;
 
     #[test]
     fn strike_time_keeps_milliseconds() {
@@ -847,5 +996,87 @@ mod tests {
             v["features"][0]["geometry"]["coordinates"],
             json!([-120.2, 35.1])
         );
+    }
+
+    fn fetch() -> Fetch {
+        Fetch::new(Duration::from_secs(10)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_strike_list_keeps_to_its_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = testing::storm(dir.path());
+        let now = now_ms();
+        let old = testing::strike("0e", (now - 4 * 3_600_000) * 1000, (35.38, -120.55), 4);
+        let event = json!({"strikes": [store::strike_json(&old)]});
+        testing::feed(&app, vec![("lightning.strikes", event)], now);
+        let base = testing::serve(app).await;
+        let f = fetch();
+        let get = async |q: &str| f.json::<Value>(&format!("{base}/api/{q}")).await.unwrap();
+        let listed = |v: &Value| v["strikes"].as_array().map_or(0, Vec::len);
+
+        let two = get("strikes?limit=2").await;
+        assert_eq!((listed(&two), two["total"].as_u64()), (2, Some(4)));
+        assert_eq!(listed(&get("strikes?limit=0").await), 1, "one at least");
+        assert_eq!(
+            listed(&get("strikes?limit=abc").await),
+            4,
+            "100 when the limit isn't a number"
+        );
+        let five = get("strikes?h=5").await;
+        assert_eq!(
+            (five["hours"].as_i64(), listed(&five)),
+            (Some(3), 4),
+            "a period it doesn't offer is 3 hours"
+        );
+        assert_eq!(listed(&get("strikes?h=24").await), 5);
+
+        let row = &two["strikes"][0];
+        assert_eq!(
+            (row["id"].as_str(), row["site_count"].as_u64()),
+            (Some("0a"), Some(4))
+        );
+        assert_eq!(row["bearings_in_fit"].as_u64(), Some(3), "one is left out");
+        assert!(row.get("sites").is_none(), "the list leaves arrivals out");
+        let one = get("strike?id=0a").await;
+        let sites = one["sites"].as_array().unwrap();
+        assert_eq!(
+            (sites.len(), sites[0]["label"].as_str()),
+            (4, Some("North ridge"))
+        );
+        assert_eq!(get("strike?id=ff").await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn the_areas_json_shows_alerts_and_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "5f".repeat(32);
+        std::fs::write(dir.path().join("local.token"), &token).unwrap();
+        let app = testing::storm(dir.path());
+        let (key, ack, secret) = {
+            let db = app.db();
+            let open = alerts::open_alerts(&db).unwrap();
+            let dry = open.iter().find(|a| a.title.starts_with("Dry")).unwrap();
+            let ack = alerts::ack_token(&db, &dry.key, dry.opened_ms).unwrap();
+            let secret: String = db
+                .query_row("SELECT secret FROM alert_secret", [], |r| r.get(0))
+                .unwrap();
+            (dry.key.clone(), ack, secret)
+        };
+        let base = testing::serve(app).await;
+        let body = fetch()
+            .json::<Value>(&format!("{base}/api/areas"))
+            .await
+            .unwrap()
+            .to_string();
+        assert!(body.contains("Dry lightning in Backcountry"), "{body}");
+        for (what, s) in [
+            ("acknowledge token", &ack),
+            ("alert secret", &secret),
+            ("core token", &token),
+            ("alert key", &key),
+        ] {
+            assert!(!body.contains(s.as_str()), "{what} in /api/areas: {body}");
+        }
     }
 }

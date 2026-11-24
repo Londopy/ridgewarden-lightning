@@ -791,6 +791,15 @@ pub fn strikes(conn: &Connection, from_us: i64, to_us: i64, limit: usize) -> Res
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// How many strikes there are from `from_us` on.
+pub fn count_strikes(conn: &Connection, from_us: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM strikes WHERE t_us >= ?1",
+        [from_us],
+        |r| r.get(0),
+    )?)
+}
+
 /// Strikes with `from_us <= t < to_us` inside a lat/lon box (south, north, west, east),
 /// newest first.
 pub fn strikes_in_box(

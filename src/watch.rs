@@ -7,7 +7,7 @@
 //! is known to be (see `store::site_pos`), and waits until it is known.
 
 use anyhow::Result;
-use ridgewarden_client::alerts::{Alert, Severity};
+use ridgewarden_client::alerts::{Alert, Open, Severity, open_alerts};
 use ridgewarden_client::util::{norm_node, short_time};
 use rusqlite::Connection;
 
@@ -105,21 +105,22 @@ pub fn alerts(views: &[AreaView], cfg: &Config, dry_open: &dyn Fn(&str) -> bool)
             v.rain.text(cfg.rain.as_ref())
         );
         let still_dry = matches!(v.rain, Verdict::Missing(_)) && dry_open(name);
+        let [dry, strike] = keys(name);
         out.push(match v.rain {
             _ if still_dry => Alert {
-                key: format!("dry:{name}"),
+                key: dry,
                 severity: Severity::Critical,
                 title: format!("Dry lightning in {name}"),
                 text: format!("{text} It was dry when this alert opened."),
             },
             Verdict::Dry { .. } => Alert {
-                key: format!("dry:{name}"),
+                key: dry,
                 severity: Severity::Critical,
                 title: format!("Dry lightning in {name}"),
                 text,
             },
             _ => Alert {
-                key: format!("strike:{name}"),
+                key: strike,
                 severity: Severity::Warning,
                 title: format!("Lightning in {name}"),
                 text,
@@ -127,6 +128,33 @@ pub fn alerts(views: &[AreaView], cfg: &Config, dry_open: &dyn Fn(&str) -> bool)
         });
     }
     out
+}
+
+/// An area's alert keys: its dry-lightning alert's, then its plain one's.
+pub fn keys(area: &str) -> [String; 2] {
+    [format!("dry:{area}"), format!("strike:{area}")]
+}
+
+/// The watch areas as the alert loop sees them.
+pub struct Status {
+    pub views: Vec<AreaView>,
+    /// the alerts that are true now
+    pub due: Vec<Alert>,
+    /// the alerts already open
+    pub open: Vec<Open>,
+}
+
+/// Each area's view, the alerts that are true now and the ones already open: what the
+/// alert loop acts on and `/api/areas` shows.
+pub fn status(conn: &Connection, cfg: &Config, now: i64) -> Result<Status> {
+    let views = views(conn, cfg, now)?;
+    let open = open_alerts(conn)?;
+    let dry_open = |area: &str| {
+        let [dry, _] = keys(area);
+        open.iter().any(|a| a.key == dry)
+    };
+    let due = alerts(&views, cfg, &dry_open);
+    Ok(Status { views, due, open })
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use ridgewarden_client::alerts;
 use ridgewarden_lightning::app::{self, App};
 use ridgewarden_lightning::config::{Config, EXAMPLE};
 use ridgewarden_lightning::sim::{self, Loops, Plan, Rng};
-use ridgewarden_lightning::{agreement, coverage, receiver, store};
+use ridgewarden_lightning::{agreement, coverage, receiver, store, top};
 use ridgewarden_lightning::{spawn_loops, web};
 
 #[derive(Parser)]
@@ -86,16 +86,29 @@ enum Cmd {
     },
     /// Send a test notice through the configured alert channels
     TestAlert,
+    /// Watch strikes, watch areas and receivers live in the terminal
+    Top {
+        /// the app's address, on this box or at another site
+        #[arg(long, default_value = "http://127.0.0.1:8796")]
+        url: String,
+        /// seconds between reads
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=600))]
+        every: u64,
+    },
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ridgewarden_lightning=info,ridgewarden_client=info".into()),
-        )
-        .init();
     let cli = Cli::parse();
+    // top draws the whole terminal, so a log line would land in the middle of it
+    if !matches!(cli.cmd, Cmd::Top { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "ridgewarden_lightning=info,ridgewarden_client=info".into()
+                }),
+            )
+            .init();
+    }
     match cli.cmd {
         Cmd::Init => {
             if cli.config.exists() {
@@ -184,6 +197,7 @@ fn main() -> Result<()> {
             let cfg = Config::load(&cli.config)?;
             tokio::runtime::Runtime::new()?.block_on(test_alert(cfg))
         }
+        Cmd::Top { url, every } => top::run(&url, std::time::Duration::from_secs(every)),
     }
 }
 
